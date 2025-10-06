@@ -19,7 +19,7 @@ for (const varName of requiredEnvVars) {
 // ------------------------------------
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.SERVER_PORT || 8000;
 const saltRounds = 10;
 
 // Instantiate Resend with your API key
