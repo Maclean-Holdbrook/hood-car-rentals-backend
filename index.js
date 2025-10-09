@@ -38,7 +38,21 @@ const db = new pg.Pool({
 
 app.use(express.json());
 app.use(express.urlencoded({extended:true}));
-app.use(cors());
+
+// CORS configuration for mobile testing and local development
+app.use(cors({
+  origin: [
+    'http://localhost:5173',           // Local development server
+    'http://192.168.0.196:5173',       // Mobile testing via IP
+    'http://localhost:8000',           // Backend local
+    'http://192.168.0.196:8000',       // Backend via IP
+    'http://127.0.0.1:5173',           // Alternative localhost
+    'http://127.0.0.1:8000'            // Alternative localhost backend
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 app.get("/", (req, res) => {
   res.send("Backend is running!");
@@ -395,5 +409,8 @@ app.post("/support-message", async (req, res) => {
 // app.get("/test", (req, res) => res.json({ message: "API is working" }));
 
 app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+  console.log(`Server running on:`);
+  console.log(`  - Local:   http://localhost:${port}`);
+  console.log(`  - Network: http://192.168.0.196:${port}`);
+  console.log(`\nCORS enabled for mobile testing from IP: 192.168.0.196`);
 });
