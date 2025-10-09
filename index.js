@@ -39,15 +39,17 @@ const db = new pg.Pool({
 app.use(express.json());
 app.use(express.urlencoded({extended:true}));
 
-// CORS configuration for mobile testing and local development
+// CORS configuration for local development, mobile testing, and production
 app.use(cors({
   origin: [
-    'http://localhost:5173',           // Local development server
-    'http://192.168.0.196:5173',       // Mobile testing via IP
-    'http://localhost:8000',           // Backend local
-    'http://192.168.0.196:8000',       // Backend via IP
-    'http://127.0.0.1:5173',           // Alternative localhost
-    'http://127.0.0.1:8000'            // Alternative localhost backend
+    'http://localhost:5173',                        // Local development server
+    'http://192.168.0.196:5173',                    // Mobile testing via IP
+    'http://localhost:8000',                        // Backend local
+    'http://192.168.0.196:8000',                    // Backend via IP
+    'http://127.0.0.1:5173',                        // Alternative localhost
+    'http://127.0.0.1:8000',                        // Alternative localhost backend
+    'https://hood-car-rentals.vercel.app',          // Production frontend (Vercel)
+    'https://hood-car-rentals-*.vercel.app'         // Preview deployments (Vercel)
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
