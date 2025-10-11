@@ -539,6 +539,17 @@ app.delete("/admin/testimonials/:id", async (req, res) => {
 
 // ============= FILE UPLOAD ENDPOINT =============
 
+// Diagnostic endpoint to check Supabase configuration
+app.get("/supabase-status", (req, res) => {
+  res.json({
+    supabaseConfigured: !!supabase,
+    hasUrl: !!process.env.SUPABASE_URL,
+    hasKey: !!process.env.SUPABASE_ANON_KEY,
+    urlPrefix: process.env.SUPABASE_URL ? process.env.SUPABASE_URL.substring(0, 20) + '...' : 'Not set',
+    message: supabase ? 'Supabase Storage is configured' : 'Supabase Storage not configured - using local storage'
+  });
+});
+
 // Upload car images (admin only)
 app.post("/upload/car-image", upload.single('image'), async (req, res) => {
   try {
