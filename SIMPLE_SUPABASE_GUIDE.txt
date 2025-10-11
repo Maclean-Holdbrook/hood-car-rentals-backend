@@ -1,0 +1,95 @@
+=====================================
+SIMPLE SUPABASE CONNECTION GUIDE
+=====================================
+
+STEP 1: Go to Supabase
+-----------------------
+Open your web browser and go to:
+https://supabase.com/dashboard
+
+Log in if you haven't already.
+
+
+STEP 2: Find Your Project
+--------------------------
+You should see a list of your projects.
+Click on the project you created (probably named "hood-car-rentals" or similar).
+
+
+STEP 3: Navigate to Database Settings
+--------------------------------------
+On the LEFT side of the screen, you'll see icons.
+Click on the GEAR ICON (⚙️) near the bottom - this is "Settings"
+Then click on "Database" in the settings menu.
+
+
+STEP 4: Find Connection Info
+-----------------------------
+Scroll down on the Database settings page.
+You'll see a section called "Connection Info" or "Connection string"
+
+Look for these values:
+
+HOST: This will look like one of these:
+  - aws-0-us-east-1.pooler.supabase.com
+  - db.abcdefghijk.supabase.co
+
+DATABASE: Usually just "postgres"
+
+PORT: Either 5432 or 6543
+
+PASSWORD: The password you created when making the project
+  (If you forgot it, there should be a "Reset Database Password" button)
+
+
+STEP 5: Alternative Method - Connection String
+-----------------------------------------------
+If you can't find the individual settings, look for "Connection string"
+It will look like this:
+
+postgresql://postgres.xxxx:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+
+From this string:
+- HOST = the part between @ and :port
+  Example: aws-0-us-east-1.pooler.supabase.com
+
+- PORT = the number after the last colon before /
+  Example: 6543
+
+- DATABASE = the part after the last /
+  Example: postgres
+
+
+STEP 6: Update Your .env File
+------------------------------
+Open: C:\Users\ebene\Desktop\Projects\Hood Car Rentals Backend\.env
+
+Change these lines:
+
+DB_HOST=db.xxxx.supabase.co          ← Replace with YOUR actual host
+DB_DATABASE=hood-car-rentals         ← Change to: postgres
+DB_PORT=5432                         ← Use 6543 if host has "pooler", or 5432 if not
+DB_PASSWORD=holdbrook1               ← Use your Supabase password
+
+
+EXAMPLE .env FILE:
+------------------
+DB_USER=postgres
+DB_HOST=aws-0-us-east-1.pooler.supabase.com
+DB_DATABASE=postgres
+DB_PASSWORD=YourSupabasePassword123
+DB_PORT=6543
+
+
+=====================================
+STILL CAN'T FIND IT?
+=====================================
+
+Option 1: Tell me which step you're stuck on
+Option 2: Take a screenshot of your Supabase dashboard
+Option 3: Use Supabase CLI (if installed):
+  supabase status
+
+Option 4: Check your email - Supabase sends connection details when you create a project
+
+=====================================

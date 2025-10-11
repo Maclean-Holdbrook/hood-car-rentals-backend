@@ -4,7 +4,14 @@ import cors from "cors";
 import bcrypt from "bcrypt";
 import { Resend } from "resend"; // Keep Resend for email functionality
 import https from "https";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from 'url';
+import { createClient } from '@supabase/supabase-js';
 import "dotenv/config"; // Load environment variables
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 
 // --- Environment Variable Validation ---
@@ -17,6 +24,18 @@ for (const varName of requiredEnvVars) {
   }
 }
 // ------------------------------------
+
+// Initialize Supabase client for storage (optional - only needed for production)
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+  supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
+  );
+  console.log('✅ Supabase Storage initialized for cloud uploads');
+} else {
+  console.log('⚠️  Supabase credentials not found - using local storage only');
+}
 
 const app = express();
 const port = process.env.SERVER_PORT || 8000;
@@ -32,12 +51,44 @@ const db = new pg.Pool({
   database: process.env.DB_DATABASE,
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
+  ssl: process.env.DB_HOST.includes('supabase') ? { rejectUnauthorized: false } : false, // Enable SSL for cloud databases
 });
 
 // The pool will connect automatically on the first query
 
 app.use(express.json());
 app.use(express.urlencoded({extended:true}));
+
+// Serve uploaded files statically
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Configure multer for file uploads
+// Use memory storage for Supabase upload, or disk storage for local
+const storage = supabase ? multer.memoryStorage() : multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, 'uploads/cars/');
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'car-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: function (req, file, cb) {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'));
+    }
+  }
+});
 
 // CORS configuration for local development, mobile testing, and production
 app.use(cors({
@@ -407,6 +458,291 @@ app.post("/support-message", async (req, res) => {
   }
 });
 
+// ============= ADMIN ENDPOINTS =============
+
+// Admin login endpoint
+app.post("/admin/login", async (req, res) => {
+  const username = req.body.username ? req.body.username.trim().toLowerCase() : null;
+  const password = req.body.password ? req.body.password.trim() : null;
+
+  if (!username || !password) {
+    return res.status(400).json({ success: false, message: "Username and password are required." });
+  }
+
+  try {
+    // Check for admin credentials - you should create an admin user in your database
+    const result = await db.query(
+      "SELECT * FROM users WHERE username = $1 AND is_admin = true",
+      [username]
+    );
+
+    if (result.rows.length > 0) {
+      const admin = result.rows[0];
+      const match = await bcrypt.compare(password, admin.password);
+
+      if (match) {
+        const { password, ...adminResponse } = admin;
+        // In production, generate a proper JWT token
+        const token = Buffer.from(`${admin.id}:${Date.now()}`).toString('base64');
+        res.status(200).json({ success: true, user: adminResponse, token });
+      } else {
+        res.status(401).json({ success: false, message: "Invalid credentials" });
+      }
+    } else {
+      res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Get all users (admin only)
+app.get("/admin/users", async (req, res) => {
+  try {
+    // In production, verify admin token here
+    const result = await db.query("SELECT id, username, email, created_at FROM users ORDER BY created_at DESC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error fetching users" });
+  }
+});
+
+// Delete user (admin only)
+app.delete("/admin/users/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // In production, verify admin token here
+    await db.query("DELETE FROM users WHERE id = $1", [id]);
+    res.status(200).json({ success: true, message: "User deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error deleting user" });
+  }
+});
+
+// Delete testimonial (admin only)
+app.delete("/admin/testimonials/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // In production, verify admin token here
+    await db.query("DELETE FROM testimonials WHERE id = $1", [id]);
+    res.status(200).json({ success: true, message: "Testimonial deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error deleting testimonial" });
+  }
+});
+
+// ============= FILE UPLOAD ENDPOINT =============
+
+// Upload car images (admin only)
+app.post("/upload/car-image", upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "No file uploaded" });
+    }
+
+    // If Supabase is configured, upload to Supabase Storage
+    if (supabase) {
+      const fileName = `car-${Date.now()}-${Math.round(Math.random() * 1E9)}${path.extname(req.file.originalname)}`;
+
+      const { data, error } = await supabase.storage
+        .from('car-images')
+        .upload(fileName, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: false
+        });
+
+      if (error) {
+        console.error('Supabase upload error:', error);
+        return res.status(500).json({ success: false, message: "Upload to cloud storage failed", error: error.message });
+      }
+
+      // Get public URL
+      const { data: { publicUrl } } = supabase.storage
+        .from('car-images')
+        .getPublicUrl(fileName);
+
+      return res.status(200).json({
+        success: true,
+        imageUrl: publicUrl,
+        filename: fileName
+      });
+    }
+
+    // Fallback to local storage if Supabase not configured
+    const imageUrl = `${req.protocol}://${req.get('host')}/uploads/cars/${req.file.filename}`;
+
+    res.status(200).json({
+      success: true,
+      imageUrl: imageUrl,
+      filename: req.file.filename
+    });
+  } catch (error) {
+    console.error("Error uploading file:", error);
+    res.status(500).json({ success: false, message: "File upload failed", error: error.message });
+  }
+});
+
+// Upload multiple car images (admin only)
+app.post("/upload/car-images", upload.array('images', 4), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ success: false, message: "No files uploaded" });
+    }
+
+    // If Supabase is configured, upload to Supabase Storage
+    if (supabase) {
+      const uploadPromises = req.files.map(async (file) => {
+        const fileName = `car-${Date.now()}-${Math.round(Math.random() * 1E9)}${path.extname(file.originalname)}`;
+
+        const { data, error } = await supabase.storage
+          .from('car-images')
+          .upload(fileName, file.buffer, {
+            contentType: file.mimetype,
+            upsert: false
+          });
+
+        if (error) {
+          throw error;
+        }
+
+        // Get public URL
+        const { data: { publicUrl } } = supabase.storage
+          .from('car-images')
+          .getPublicUrl(fileName);
+
+        return publicUrl;
+      });
+
+      const imageUrls = await Promise.all(uploadPromises);
+
+      return res.status(200).json({
+        success: true,
+        imageUrls: imageUrls
+      });
+    }
+
+    // Fallback to local storage if Supabase not configured
+    const imageUrls = req.files.map(file =>
+      `${req.protocol}://${req.get('host')}/uploads/cars/${file.filename}`
+    );
+
+    res.status(200).json({
+      success: true,
+      imageUrls: imageUrls
+    });
+  } catch (error) {
+    console.error("Error uploading files:", error);
+    res.status(500).json({ success: false, message: "File upload failed", error: error.message });
+  }
+});
+
+// ============= CARS MANAGEMENT ENDPOINTS =============
+
+// Get all cars
+app.get("/cars", async (req, res) => {
+  try {
+    const result = await db.query("SELECT * FROM cars WHERE is_available = true ORDER BY created_at DESC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error fetching cars" });
+  }
+});
+
+// Get all cars (admin - includes unavailable)
+app.get("/admin/cars", async (req, res) => {
+  try {
+    const result = await db.query("SELECT * FROM cars ORDER BY created_at DESC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error fetching cars" });
+  }
+});
+
+// Get single car
+app.get("/cars/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await db.query("SELECT * FROM cars WHERE id = $1", [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Car not found" });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error fetching car" });
+  }
+});
+
+// Add new car (admin only)
+app.post("/admin/cars", async (req, res) => {
+  const { title, description, price_per_day, transmission, seats, has_ac, category, image_url, image_url_2, image_url_3, image_url_4, is_available } = req.body;
+
+  // Validation
+  if (!title || !description || !price_per_day) {
+    return res.status(400).json({ success: false, message: "Title, description, and price are required" });
+  }
+
+  try {
+    const result = await db.query(
+      `INSERT INTO cars (title, description, price_per_day, transmission, seats, has_ac, category, image_url, image_url_2, image_url_3, image_url_4, is_available)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [title, description, price_per_day, transmission || 'Automatic', seats || 5, has_ac !== false, category || 'Sedan', image_url, image_url_2, image_url_3, image_url_4, is_available !== false]
+    );
+    res.status(201).json({ success: true, car: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error adding car" });
+  }
+});
+
+// Update car (admin only)
+app.put("/admin/cars/:id", async (req, res) => {
+  const { id } = req.params;
+  const { title, description, price_per_day, transmission, seats, has_ac, category, image_url, image_url_2, image_url_3, image_url_4, is_available } = req.body;
+
+  try {
+    const result = await db.query(
+      `UPDATE cars
+       SET title = $1, description = $2, price_per_day = $3, transmission = $4, seats = $5,
+           has_ac = $6, category = $7, image_url = $8, image_url_2 = $9, image_url_3 = $10,
+           image_url_4 = $11, is_available = $12
+       WHERE id = $13
+       RETURNING *`,
+      [title, description, price_per_day, transmission, seats, has_ac, category, image_url, image_url_2, image_url_3, image_url_4, is_available, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Car not found" });
+    }
+
+    res.json({ success: true, car: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error updating car" });
+  }
+});
+
+// Delete car (admin only)
+app.delete("/admin/cars/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await db.query("DELETE FROM cars WHERE id = $1", [id]);
+    res.status(200).json({ success: true, message: "Car deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error deleting car" });
+  }
+});
 
 // app.get("/test", (req, res) => res.json({ message: "API is working" }));
 

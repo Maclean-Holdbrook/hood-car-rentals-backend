@@ -1,0 +1,47 @@
+==================================
+WHAT TO DO NOW IN SUPABASE
+==================================
+
+YOU'RE IN THE RIGHT PLACE! Just need to scroll up.
+
+Option 1: SCROLL UP on the Database Settings page
+--------------------------------------------------
+You're currently at the BOTTOM of the page (showing SSL Configuration).
+Scroll UP to the TOP of the page.
+You should see a section called "Connection string" or "Connection info"
+
+Look for something that shows:
+- Host
+- Database name
+- Port
+- User
+
+Take a screenshot of that!
+
+
+Option 2: Click the "Connect" button
+------------------------------------
+At the top of your Supabase page, there's a "Connect" button.
+Click it and it will show you the connection details.
+
+
+Option 3: Try the API Settings
+------------------------------
+1. In the left sidebar, click on the GEAR icon (Settings)
+2. Click on "API" instead of "Database"
+3. Scroll down to find "Database URL" or connection details
+
+==================================
+
+Once you find it, you're looking for a HOST that looks like:
+  aws-0-us-west-1.pooler.supabase.com
+  OR
+  db.kanswmvhvwdtwyzgsnwf.supabase.co
+
+From your URL, I can see part of it:
+  kanswmvhvwdtwyzgsnwf
+
+So your host is probably:
+  db.kanswmvhvwdtwyzgsnwf.supabase.co
+
+==================================
