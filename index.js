@@ -204,7 +204,9 @@ app.post("/login", async (req, res) => {
       if (match) {
         console.log("Password match successful.");
         const { password, ...userResponse } = user; // Omit password from response
-        res.status(200).json({ success: true, user: userResponse });
+        // Generate a simple token (in production, use JWT)
+        const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+        res.status(200).json({ success: true, user: userResponse, token });
       } else {
         console.log("Password match failed.");
         res.status(401).json({ success: false, message: "Invalid credentials" });
@@ -219,8 +221,70 @@ app.post("/login", async (req, res) => {
   }
 });
 
+// Google OAuth authentication endpoint
+app.post("/auth/google", async (req, res) => {
+  const { credential } = req.body;
+
+  if (!credential) {
+    return res.status(400).json({ success: false, message: "Google credential is required." });
+  }
+
+  try {
+    // Decode the JWT credential from Google
+    // The credential is a JWT token with 3 parts separated by dots
+    const base64Url = credential.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(Buffer.from(base64, 'base64').toString().split('').map(function(c) {
+      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+    }).join(''));
+
+    const googleUser = JSON.parse(jsonPayload);
+
+    // Extract user information from Google token
+    const email = googleUser.email.toLowerCase();
+    const name = googleUser.name || googleUser.email.split('@')[0];
+
+    // Check if user exists
+    let result = await db.query("SELECT * FROM users WHERE email = $1", [email]);
+
+    let user;
+    if (result.rows.length > 0) {
+      // User exists, log them in
+      user = result.rows[0];
+    } else {
+      // Create new user
+      const username = email.split('@')[0].toLowerCase() + '_' + Math.floor(Math.random() * 1000);
+      const randomPassword = Math.random().toString(36).slice(-10);
+      const hashedPassword = await bcrypt.hash(randomPassword, saltRounds);
+
+      result = await db.query(
+        "INSERT INTO users (username, password, email) VALUES ($1, $2, $3) RETURNING id, username, email",
+        [username, hashedPassword, email]
+      );
+      user = result.rows[0];
+    }
+
+    // Generate token
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    const { password, ...userResponse } = user;
+
+    res.status(200).json({
+      success: true,
+      user: {
+        ...userResponse,
+        name: name
+      },
+      token
+    });
+
+  } catch (err) {
+    console.error("Google auth error:", err);
+    res.status(500).json({ success: false, message: "Failed to authenticate with Google" });
+  }
+});
+
 app.post("/send-booking-quote", async (req, res) => {
-  const { car, bookingDetails, user: userPayload } = req.body;
+  const { car, bookingDetails, user: userPayload, totalAmount: providedTotal, paymentStatus } = req.body;
 
   // --- Input Validation ---
   if (!car || !bookingDetails || !userPayload || typeof car !== 'object' || typeof bookingDetails !== 'object') {
@@ -240,14 +304,44 @@ app.post("/send-booking-quote", async (req, res) => {
       throw new Error("Essential details like car title, price, start date, number of days, and user email are required.");
     }
 
-    const totalAmount = (parseFloat(String(car.price).replace(/[^0-9.-]+/g,"")) * bookingDetails.numDays).toFixed(2);
+    const totalAmount = providedTotal || (parseFloat(String(car.price).replace(/[^0-9.-]+/g,"")) * bookingDetails.numDays).toFixed(2);
+    const pricePerDay = parseFloat(String(car.price).replace(/[^0-9.-]+/g,""));
+
+    // Save booking to database
+    const bookingResult = await db.query(
+      `INSERT INTO bookings (
+        user_id, user_name, user_email, car_id, car_title, car_price_per_day,
+        region, city, area, start_date, end_date, num_days, total_amount, payment_status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      RETURNING id`,
+      [
+        user.id || null,
+        user.username || user.name || 'N/A',
+        user.email,
+        car.id || null,
+        car.title,
+        pricePerDay,
+        bookingDetails.selectedRegion,
+        bookingDetails.selectedCity,
+        bookingDetails.selectedArea,
+        bookingDetails.startDate,
+        bookingDetails.endDate,
+        bookingDetails.numDays,
+        totalAmount,
+        paymentStatus || 'unpaid'
+      ]
+    );
+
+    const bookingId = bookingResult.rows[0].id;
 
     // --- Email Sending Logic ---
     const emailBodyHtml = `
       <h1>Your Car Rental Quote</h1>
-      <p>Hello ${user.username || 'Valued Customer'},</p>
+      <p>Hello ${user.username || user.name || 'Valued Customer'},</p>
       <p>Thank you for your interest! Here is the quote for your requested booking:</p>
-      
+
+      <h2>Booking ID: #${bookingId}</h2>
+
       <h2>Car Details</h2>
       <ul>
         <li><strong>Car:</strong> ${car.title}</li>
@@ -268,8 +362,9 @@ app.post("/send-booking-quote", async (req, res) => {
      <ul>
         <li><strong>Email:</strong> ${user.email || 'N/A'}</li>
      </ul>
-      
+
       <h2>Total Estimated Cost: GH¢${totalAmount}</h2>
+      <h3>Payment Status: ${paymentStatus || 'Unpaid'}</h3>
       <p>Thank you,<br>Hood Car Rentals</p>
     `;
 
@@ -277,26 +372,30 @@ app.post("/send-booking-quote", async (req, res) => {
       from: 'onboarding@resend.dev',
       // On Resend's free plan, you can only send to your own verified email.
       to: "macleaann723@gmail.com",
-      subject: `Your Quote for ${car.title}`,
+      subject: `Booking #${bookingId} - ${car.title}`,
       html: emailBodyHtml,
     };
 
     const { data, error } = await resend.emails.send(mailOptions);
 
     if (error) {
-      // If the Resend service returns an error, throw it to the catch block
-      throw error;
+      // If email fails, still return success since booking was saved
+      console.error("Booking saved but email failed:", error);
     }
 
-    res.status(200).json({ success: true, message: "Booking quote sent successfully." });
+    res.status(200).json({
+      success: true,
+      message: "Booking saved successfully.",
+      bookingId: bookingId
+    });
   } catch (err) {
-    console.error("Error sending booking quote:", err);
-    res.status(500).json({ success: false, message: "Failed to send quote due to a server error.", error: err.message });
+    console.error("Error processing booking:", err);
+    res.status(500).json({ success: false, message: "Failed to process booking due to a server error.", error: err.message });
   }
 });
 
 app.post("/paystack/verify-payment", async (req, res) => {
-  const { reference } = req.body;
+  const { reference, car, bookingDetails, user, totalAmount } = req.body;
 
   if (!reference) {
     return res.status(400).json({ success: false, message: "Payment reference is required for verification." });
@@ -323,18 +422,52 @@ app.post("/paystack/verify-payment", async (req, res) => {
           console.log("Paystack verification successful:", body.data);
           const { customer, amount } = body.data;
 
-          // Here you would save the booking to your database
-          // e.g., await db.query('INSERT INTO bookings (customer_email, amount, reference) VALUES ($1, $2, $3)', [customer.email, amount, reference]);
+          // Save booking to database with paid status
+          let bookingId;
+          if (car && bookingDetails && user) {
+            const pricePerDay = parseFloat(String(car.price).replace(/[^0-9.-]+/g,""));
+
+            const bookingResult = await db.query(
+              `INSERT INTO bookings (
+                user_id, user_name, user_email, car_id, car_title, car_price_per_day,
+                region, city, area, start_date, end_date, num_days, total_amount,
+                payment_status, payment_reference
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              RETURNING id`,
+              [
+                user.id || null,
+                user.username || user.name || customer.first_name || 'N/A',
+                user.email || customer.email,
+                car.id || null,
+                car.title,
+                pricePerDay,
+                bookingDetails.selectedRegion,
+                bookingDetails.selectedCity,
+                bookingDetails.selectedArea,
+                bookingDetails.startDate,
+                bookingDetails.endDate,
+                bookingDetails.numDays,
+                totalAmount || (amount / 100).toFixed(2),
+                'paid',
+                reference
+              ]
+            );
+
+            bookingId = bookingResult.rows[0].id;
+          }
 
           // Send a final confirmation email
           const emailBodyHtml = `
             <h1>Booking Confirmed!</h1>
-            <p>Thank you, ${customer.first_name || 'Valued Customer'}! Your payment has been received and your booking is confirmed.</p>
+            <p>Thank you, ${customer.first_name || user?.username || 'Valued Customer'}! Your payment has been received and your booking is confirmed.</p>
+            ${bookingId ? `<h2>Booking ID: #${bookingId}</h2>` : ''}
             <h2>Receipt Details:</h2>
             <ul>
               <li><strong>Reference:</strong> ${reference}</li>
               <li><strong>Amount Paid:</strong> GHS ${(amount / 100).toFixed(2)}</li>
               <li><strong>Customer Email:</strong> ${customer.email}</li>
+              ${car ? `<li><strong>Car:</strong> ${car.title}</li>` : ''}
+              ${bookingDetails ? `<li><strong>Dates:</strong> ${new Date(bookingDetails.startDate).toLocaleDateString()} - ${new Date(bookingDetails.endDate).toLocaleDateString()}</li>` : ''}
             </ul>
             <p>We will be in touch shortly with the final details of your car rental.</p>
           `;
@@ -343,11 +476,11 @@ app.post("/paystack/verify-payment", async (req, res) => {
             from: 'onboarding@resend.dev',
             // On Resend's free plan, you can only send to your own verified email.
             to: "macleaann723@gmail.com",
-            subject: 'Your Car Rental Booking is Confirmed!',
+            subject: bookingId ? `Booking #${bookingId} Confirmed - Payment Received` : 'Your Car Rental Booking is Confirmed!',
             html: emailBodyHtml,
           };
 
-          const { data, error } = await resend.emails.send(mailOptions);
+          const { data: emailData, error } = await resend.emails.send(mailOptions);
 
           if (error) {
             // If Resend fails, we still consider the payment successful but log the email error.
@@ -355,7 +488,11 @@ app.post("/paystack/verify-payment", async (req, res) => {
             console.error("Payment was verified, but confirmation email failed to send:", error);
           }
 
-          res.status(200).json({ success: true, message: "Payment verified and booking confirmed." });
+          res.status(200).json({
+            success: true,
+            message: "Payment verified and booking confirmed.",
+            bookingId: bookingId
+          });
         } else {
           // Payment verification failed
           res.status(400).json({ success: false, message: body.message || "Payment verification failed." });
@@ -534,6 +671,54 @@ app.delete("/admin/testimonials/:id", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: "Error deleting testimonial" });
+  }
+});
+
+// Get all bookings (admin only)
+app.get("/admin/bookings", async (req, res) => {
+  try {
+    // In production, verify admin token here
+    const result = await db.query(`
+      SELECT
+        id,
+        user_id,
+        user_name,
+        user_email,
+        car_id,
+        car_title,
+        car_price_per_day,
+        region,
+        city,
+        area,
+        start_date,
+        end_date,
+        num_days,
+        total_amount,
+        payment_status,
+        payment_reference,
+        created_at,
+        updated_at
+      FROM bookings
+      ORDER BY created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching bookings:", err);
+    res.status(500).json({ success: false, message: "Error fetching bookings" });
+  }
+});
+
+// Delete booking (admin only)
+app.delete("/admin/bookings/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // In production, verify admin token here
+    await db.query("DELETE FROM bookings WHERE id = $1", [id]);
+    res.status(200).json({ success: true, message: "Booking deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Error deleting booking" });
   }
 });
 
