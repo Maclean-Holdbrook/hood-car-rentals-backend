@@ -94,10 +94,13 @@ const upload = multer({
 app.use(cors({
   origin: [
     'http://localhost:5173',                        // Local development server
+    'http://localhost:5174',                        // Local development server (alt port)
     'http://192.168.0.196:5173',                    // Mobile testing via IP
+    'http://192.168.0.196:5174',                    // Mobile testing via IP (alt port)
     'http://localhost:8000',                        // Backend local
     'http://192.168.0.196:8000',                    // Backend via IP
     'http://127.0.0.1:5173',                        // Alternative localhost
+    'http://127.0.0.1:5174',                        // Alternative localhost (alt port)
     'http://127.0.0.1:8000',                        // Alternative localhost backend
     'https://hood-car-rentals.vercel.app',          // Production frontend (Vercel)
     'https://hood-car-rentals-*.vercel.app'         // Preview deployments (Vercel)
@@ -223,26 +226,35 @@ app.post("/login", async (req, res) => {
 
 // Google OAuth authentication endpoint
 app.post("/auth/google", async (req, res) => {
-  const { credential } = req.body;
+  const { credential, email: directEmail, name: directName, googleId } = req.body;
 
-  if (!credential) {
-    return res.status(400).json({ success: false, message: "Google credential is required." });
+  // Support both old (credential) and new (direct user info) format
+  let email, name;
+
+  if (credential) {
+    // Old format: Decode JWT credential from Google
+    try {
+      const base64Url = credential.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(Buffer.from(base64, 'base64').toString().split('').map(function(c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+
+      const googleUser = JSON.parse(jsonPayload);
+      email = googleUser.email.toLowerCase();
+      name = googleUser.name || googleUser.email.split('@')[0];
+    } catch (err) {
+      return res.status(400).json({ success: false, message: "Invalid Google credential." });
+    }
+  } else if (directEmail) {
+    // New format: Direct user information
+    email = directEmail.toLowerCase();
+    name = directName || directEmail.split('@')[0];
+  } else {
+    return res.status(400).json({ success: false, message: "Google authentication data is required." });
   }
 
   try {
-    // Decode the JWT credential from Google
-    // The credential is a JWT token with 3 parts separated by dots
-    const base64Url = credential.split('.')[1];
-    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-    const jsonPayload = decodeURIComponent(Buffer.from(base64, 'base64').toString().split('').map(function(c) {
-      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-    }).join(''));
-
-    const googleUser = JSON.parse(jsonPayload);
-
-    // Extract user information from Google token
-    const email = googleUser.email.toLowerCase();
-    const name = googleUser.name || googleUser.email.split('@')[0];
 
     // Check if user exists
     let result = await db.query("SELECT * FROM users WHERE email = $1", [email]);
@@ -280,6 +292,462 @@ app.post("/auth/google", async (req, res) => {
   } catch (err) {
     console.error("Google auth error:", err);
     res.status(500).json({ success: false, message: "Failed to authenticate with Google" });
+  }
+});
+
+// Google OAuth code exchange endpoint (for redirect flow)
+app.post("/auth/google/callback", async (req, res) => {
+  const { code, redirect_uri } = req.body;
+
+  if (!code) {
+    return res.status(400).json({ success: false, message: "Authorization code is required." });
+  }
+
+  try {
+    // Exchange code for tokens
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirect_uri,
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    const tokenData = await tokenResponse.json();
+
+    if (tokenData.error) {
+      return res.status(400).json({ success: false, message: tokenData.error_description || 'Token exchange failed' });
+    }
+
+    // Get user info from Google
+    const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+
+    const userInfo = await userInfoResponse.json();
+    const email = userInfo.email.toLowerCase();
+    const name = userInfo.name || userInfo.email.split('@')[0];
+
+    // Check if user exists
+    let result = await db.query("SELECT * FROM users WHERE email = $1", [email]);
+
+    let user;
+    if (result.rows.length > 0) {
+      // User exists, log them in
+      user = result.rows[0];
+    } else {
+      // Create new user
+      const username = email.split('@')[0].toLowerCase() + '_' + Math.floor(Math.random() * 1000);
+      const randomPassword = Math.random().toString(36).slice(-10);
+      const hashedPassword = await bcrypt.hash(randomPassword, saltRounds);
+
+      result = await db.query(
+        "INSERT INTO users (username, password, email) VALUES ($1, $2, $3) RETURNING id, username, email",
+        [username, hashedPassword, email]
+      );
+      user = result.rows[0];
+    }
+
+    // Generate token
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    const { password, ...userResponse } = user;
+
+    res.status(200).json({
+      success: true,
+      user: {
+        ...userResponse,
+        name: name
+      },
+      token
+    });
+
+  } catch (err) {
+    console.error("Google OAuth callback error:", err);
+    res.status(500).json({ success: false, message: "Failed to process Google authentication" });
+  }
+});
+
+// ============= MAGIC LINK AUTHENTICATION =============
+
+// Store for magic link tokens (in production, use Redis or database)
+const magicLinkTokens = new Map();
+
+// Store for OTP codes (in production, use Redis or database)
+const otpCodes = new Map();
+
+// Request magic link endpoint
+app.post("/auth/magic-link/request", async (req, res) => {
+  const email = req.body.email ? req.body.email.trim().toLowerCase() : null;
+
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Email is required." });
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ success: false, message: "Invalid email format." });
+  }
+
+  try {
+    // Check if user exists, if not create one
+    let result = await db.query("SELECT * FROM users WHERE email = $1", [email]);
+
+    let user;
+    let isNewUser = false;
+
+    if (result.rows.length > 0) {
+      user = result.rows[0];
+    } else {
+      // Create new user with magic link
+      const username = email.split('@')[0].toLowerCase() + '_' + Math.floor(Math.random() * 1000);
+      const randomPassword = Math.random().toString(36).slice(-10);
+      const hashedPassword = await bcrypt.hash(randomPassword, saltRounds);
+
+      result = await db.query(
+        "INSERT INTO users (username, password, email) VALUES ($1, $2, $3) RETURNING id, username, email",
+        [username, hashedPassword, email]
+      );
+      user = result.rows[0];
+      isNewUser = true;
+    }
+
+    // Generate magic link token (valid for 15 minutes)
+    const token = Buffer.from(`${user.id}:${Date.now()}:${Math.random()}`).toString('base64url');
+    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes
+
+    // Store token
+    magicLinkTokens.set(token, {
+      userId: user.id,
+      email: email,
+      expiresAt: expiresAt
+    });
+
+    // Clean up expired tokens
+    for (const [key, value] of magicLinkTokens.entries()) {
+      if (value.expiresAt < Date.now()) {
+        magicLinkTokens.delete(key);
+      }
+    }
+
+    // Create magic link
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const magicLink = `${frontendUrl}/auth/verify?token=${token}`;
+
+    // Send email with magic link
+    const emailBodyHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h1 style="color: #333;">Welcome ${isNewUser ? 'to Hood Car Rentals' : 'back'}!</h1>
+        <p style="font-size: 16px; color: #555;">
+          ${isNewUser ? 'Thanks for signing up!' : 'You requested to log in to your account.'}
+        </p>
+        <p style="font-size: 16px; color: #555;">
+          Click the button below to ${isNewUser ? 'verify your email and complete your registration' : 'log in to your account'}:
+        </p>
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="${magicLink}"
+             style="background-color: #007bff; color: white; padding: 12px 30px;
+                    text-decoration: none; border-radius: 5px; font-size: 16px; display: inline-block;">
+            ${isNewUser ? 'Complete Registration' : 'Log In to Your Account'}
+          </a>
+        </div>
+        <p style="font-size: 14px; color: #888;">
+          Or copy and paste this link in your browser:<br>
+          <a href="${magicLink}" style="color: #007bff;">${magicLink}</a>
+        </p>
+        <p style="font-size: 14px; color: #888;">
+          This link will expire in 15 minutes.
+        </p>
+        <p style="font-size: 14px; color: #888;">
+          If you didn't request this ${isNewUser ? 'registration' : 'login'}, you can safely ignore this email.
+        </p>
+        <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+        <p style="font-size: 12px; color: #aaa; text-align: center;">
+          Hood Car Rentals - Your trusted car rental service
+        </p>
+      </div>
+    `;
+
+    const mailOptions = {
+      from: 'onboarding@resend.dev',
+      to: email,
+      subject: isNewUser ? 'Complete Your Registration - Hood Car Rentals' : 'Your Login Link - Hood Car Rentals',
+      html: emailBodyHtml,
+    };
+
+    const { data, error } = await resend.emails.send(mailOptions);
+
+    if (error) {
+      console.error("Failed to send magic link email:", error);
+      return res.status(500).json({ success: false, message: "Failed to send magic link. Please try again." });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Magic link sent to ${email}. Please check your inbox.`,
+      expiresIn: 900 // 15 minutes in seconds
+    });
+
+  } catch (err) {
+    console.error("Magic link request error:", err);
+    res.status(500).json({ success: false, message: "Failed to process magic link request" });
+  }
+});
+
+// Verify magic link token endpoint
+app.post("/auth/magic-link/verify", async (req, res) => {
+  const { token } = req.body;
+
+  if (!token) {
+    return res.status(400).json({ success: false, message: "Token is required." });
+  }
+
+  try {
+    // Get token data
+    const tokenData = magicLinkTokens.get(token);
+
+    if (!tokenData) {
+      return res.status(401).json({ success: false, message: "Invalid or expired magic link." });
+    }
+
+    // Check if token is expired
+    if (tokenData.expiresAt < Date.now()) {
+      magicLinkTokens.delete(token);
+      return res.status(401).json({ success: false, message: "Magic link has expired. Please request a new one." });
+    }
+
+    // Get user
+    const result = await db.query("SELECT * FROM users WHERE id = $1", [tokenData.userId]);
+
+    if (result.rows.length === 0) {
+      magicLinkTokens.delete(token);
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    const user = result.rows[0];
+
+    // Delete used token
+    magicLinkTokens.delete(token);
+
+    // Generate auth token
+    const authToken = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    const { password, ...userResponse } = user;
+
+    res.status(200).json({
+      success: true,
+      message: "Successfully authenticated!",
+      user: userResponse,
+      token: authToken
+    });
+
+  } catch (err) {
+    console.error("Magic link verification error:", err);
+    res.status(500).json({ success: false, message: "Failed to verify magic link" });
+  }
+});
+
+// ============= EMAIL OTP AUTHENTICATION =============
+
+// Request OTP code endpoint
+app.post("/auth/otp/request", async (req, res) => {
+  const email = req.body.email ? req.body.email.trim().toLowerCase() : null;
+
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Email is required." });
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ success: false, message: "Invalid email format." });
+  }
+
+  try {
+    // Check if user exists, if not create one
+    let result = await db.query("SELECT * FROM users WHERE email = $1", [email]);
+
+    let user;
+    let isNewUser = false;
+
+    if (result.rows.length > 0) {
+      user = result.rows[0];
+    } else {
+      // Create new user with OTP
+      const username = email.split('@')[0].toLowerCase() + '_' + Math.floor(Math.random() * 1000);
+      const randomPassword = Math.random().toString(36).slice(-10);
+      const hashedPassword = await bcrypt.hash(randomPassword, saltRounds);
+
+      result = await db.query(
+        "INSERT INTO users (username, password, email) VALUES ($1, $2, $3) RETURNING id, username, email",
+        [username, hashedPassword, email]
+      );
+      user = result.rows[0];
+      isNewUser = true;
+    }
+
+    // Generate 6-digit OTP code
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    // Store OTP
+    otpCodes.set(email, {
+      code: otpCode,
+      userId: user.id,
+      expiresAt: expiresAt,
+      attempts: 0
+    });
+
+    // Clean up expired OTPs
+    for (const [key, value] of otpCodes.entries()) {
+      if (value.expiresAt < Date.now()) {
+        otpCodes.delete(key);
+      }
+    }
+
+    // Send email with OTP code
+    const emailBodyHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #333; font-size: 28px; margin-bottom: 10px;">
+            ${isNewUser ? 'Welcome to Hood Car Rentals!' : 'Welcome back!'}
+          </h1>
+          <p style="color: #666; font-size: 16px;">
+            ${isNewUser ? 'Complete your registration with the code below' : 'Use the code below to log in to your account'}
+          </p>
+        </div>
+
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    border-radius: 12px; padding: 30px; text-align: center; margin: 30px 0;">
+          <p style="color: white; font-size: 14px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px;">
+            Your verification code
+          </p>
+          <div style="background: white; border-radius: 8px; padding: 20px; margin: 15px 0;">
+            <p style="font-size: 36px; font-weight: bold; color: #333; margin: 0; letter-spacing: 8px; font-family: monospace;">
+              ${otpCode}
+            </p>
+          </div>
+          <p style="color: rgba(255,255,255,0.9); font-size: 14px; margin-top: 15px;">
+            This code expires in <strong>10 minutes</strong>
+          </p>
+        </div>
+
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; margin: 20px 0;">
+          <p style="color: #666; font-size: 14px; margin: 0 0 10px 0;">
+            <strong>Security tips:</strong>
+          </p>
+          <ul style="color: #666; font-size: 14px; margin: 0; padding-left: 20px;">
+            <li>Never share this code with anyone</li>
+            <li>Hood Car Rentals will never ask for this code via phone or email</li>
+            <li>If you didn't request this code, please ignore this email</li>
+          </ul>
+        </div>
+
+        <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
+          <p style="color: #999; font-size: 12px; margin: 0;">
+            Hood Car Rentals - Your trusted car rental service
+          </p>
+        </div>
+      </div>
+    `;
+
+    const mailOptions = {
+      from: 'onboarding@resend.dev',
+      to: email,
+      subject: isNewUser ? 'Your Verification Code - Hood Car Rentals' : 'Your Login Code - Hood Car Rentals',
+      html: emailBodyHtml,
+    };
+
+    const { data, error } = await resend.emails.send(mailOptions);
+
+    if (error) {
+      console.error("Failed to send OTP email:", error);
+      return res.status(500).json({ success: false, message: "Failed to send verification code. Please try again." });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Verification code sent to ${email}. Please check your inbox.`,
+      expiresIn: 600 // 10 minutes in seconds
+    });
+
+  } catch (err) {
+    console.error("OTP request error:", err);
+    res.status(500).json({ success: false, message: "Failed to process OTP request" });
+  }
+});
+
+// Verify OTP code endpoint
+app.post("/auth/otp/verify", async (req, res) => {
+  const { email, code } = req.body;
+
+  if (!email || !code) {
+    return res.status(400).json({ success: false, message: "Email and verification code are required." });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedCode = code.trim();
+
+  try {
+    // Get OTP data
+    const otpData = otpCodes.get(normalizedEmail);
+
+    if (!otpData) {
+      return res.status(401).json({ success: false, message: "Invalid or expired verification code." });
+    }
+
+    // Check if expired
+    if (otpData.expiresAt < Date.now()) {
+      otpCodes.delete(normalizedEmail);
+      return res.status(401).json({ success: false, message: "Verification code has expired. Please request a new one." });
+    }
+
+    // Check attempts (max 5 attempts)
+    if (otpData.attempts >= 5) {
+      otpCodes.delete(normalizedEmail);
+      return res.status(429).json({ success: false, message: "Too many failed attempts. Please request a new code." });
+    }
+
+    // Verify code
+    if (otpData.code !== normalizedCode) {
+      otpData.attempts++;
+      return res.status(401).json({
+        success: false,
+        message: "Invalid verification code. Please try again.",
+        attemptsRemaining: 5 - otpData.attempts
+      });
+    }
+
+    // Code is valid - get user
+    const result = await db.query("SELECT * FROM users WHERE id = $1", [otpData.userId]);
+
+    if (result.rows.length === 0) {
+      otpCodes.delete(normalizedEmail);
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    const user = result.rows[0];
+
+    // Delete used OTP
+    otpCodes.delete(normalizedEmail);
+
+    // Generate auth token
+    const authToken = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    const { password, ...userResponse } = user;
+
+    res.status(200).json({
+      success: true,
+      message: "Successfully authenticated!",
+      user: userResponse,
+      token: authToken
+    });
+
+  } catch (err) {
+    console.error("OTP verification error:", err);
+    res.status(500).json({ success: false, message: "Failed to verify code" });
   }
 });
 
@@ -948,3 +1416,4 @@ app.listen(port, () => {
   console.log(`  - Network: http://192.168.0.196:${port}`);
   console.log(`\nCORS enabled for mobile testing from IP: 192.168.0.196`);
 });
+
