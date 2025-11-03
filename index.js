@@ -15,7 +15,17 @@ const __dirname = path.dirname(__filename);
 
 
 // --- Environment Variable Validation ---
-const requiredEnvVars = ['DB_USER', 'DB_HOST', 'DB_DATABASE', 'DB_PASSWORD', 'DB_PORT', 'RESEND_API_KEY', 'PAYSTACK_SECRET_KEY'];
+// Check if DATABASE_URL is provided (for serverless/production) or individual DB vars (for local dev)
+const hasDatabaseUrl = !!process.env.DATABASE_URL;
+const hasIndividualDbVars = process.env.DB_USER && process.env.DB_HOST && process.env.DB_DATABASE && process.env.DB_PASSWORD && process.env.DB_PORT;
+
+if (!hasDatabaseUrl && !hasIndividualDbVars) {
+  console.error('FATAL ERROR: Database configuration missing.');
+  console.error('Provide either DATABASE_URL or individual DB_* environment variables.');
+  process.exit(1);
+}
+
+const requiredEnvVars = ['RESEND_API_KEY', 'PAYSTACK_SECRET_KEY'];
 for (const varName of requiredEnvVars) {
   if (!process.env[varName]) {
     console.error(`FATAL ERROR: Environment variable ${varName} is not defined.`);
@@ -45,14 +55,22 @@ const saltRounds = 10;
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // Use a connection pool instead of a single client for better stability
-const db = new pg.Pool({
+// Support both DATABASE_URL (serverless) and individual variables (local dev)
+const dbConfig = process.env.DATABASE_URL ? {
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+} : {
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
   database: process.env.DB_DATABASE,
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
-  ssl: process.env.DB_HOST.includes('supabase') ? { rejectUnauthorized: false } : false, // Enable SSL for cloud databases
-});
+  ssl: process.env.DB_HOST?.includes('supabase') ? { rejectUnauthorized: false } : false, // Enable SSL for cloud databases
+};
+
+const db = new pg.Pool(dbConfig);
 
 // The pool will connect automatically on the first query
 
